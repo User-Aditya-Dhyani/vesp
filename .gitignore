@@ -1,0 +1,21 @@
+.venv/
+venv/
+# python caches & artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+.vscode/
+.idea/
+.DS_Store
+.coverage
+.coverage.*
+htmlcov/
+*.log
+.env
+.env.*
