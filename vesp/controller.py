@@ -20,21 +20,13 @@ MESH_PATH = "/org/bluez/mesh"
 
 
 class Controller:
-    """
-    ADV-only Bluetooth Mesh controller:
-      - Exports Application1, ProvisionAgent1, Provisioner1, Element1
-      - CreateNetwork/Attach (laptop becomes a node)
-      - UnprovisionedScan, AddNode by UUID (PB-ADV)
-      - DevKey/AppKey helpers (Config Client-style ops)
-    """
-
     def __init__(self):
-        # Remember the UUID we attempted to join with (persist only on success)
         self._pending_uuid: bytes | None = None
 
-        # D-Bus connection + root "Network1" object
+        # DBus
         self.bus = SystemBus()
-        self.mesh = self.bus.get(MESH_BUS, MESH_PATH)
+        self.mesh = None  # lazy (see _get_mesh)
+        self._attach_in_progress = False
 
         # Exported objects
         self.app = AppRoot()
@@ -43,24 +35,90 @@ class Controller:
         for obj in (self.app, self.agent, self.elem0):
             obj.controller = self
 
-
-        self.node_path: Optional[str] = None  # Path returned by Attach()
-        self.mgmt = None                      # Proxy bound to self.node_path
+        self.node_path: Optional[str] = None
+        self.mgmt = None
 
         # GUI callbacks
         self._log_cb: Callable[[str], None] = lambda s: print(s)
         self._scan_cb: Callable[[str, int], None] = lambda uuid_hex, rssi: None
 
-        # Simple address allocator used by Provisioner.RequestProvData
+        # allocator for RequestProvData
         self._next_unicast = 0x0005
 
-        # GLib main loop (for D-Bus callbacks)
+        # GLib main loop
         self._glib_loop: Optional[GLib.MainLoop] = None
 
+    # --------- helpers (lazy mesh + systemd) ----------
+    def _get_mesh(self):
+        if self.mesh is not None:
+            return self.mesh
+        try:
+            self.mesh = self.bus.get(MESH_BUS, MESH_PATH)
+            return self.mesh
+        except KeyError:
+            raise RuntimeError("bluetooth-meshd is not on D-Bus yet. Is the service running?")
+
+    def _systemd(self):
+        # org.freedesktop.systemd1 Manager API (polkit will prompt via agent if needed)
+        return self.bus.get("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+
+    def _systemd_restart_meshd(self):
+        def do():
+            self._systemd().RestartUnit("bluetooth-meshd.service", "replace")
+        return self._safe_call(do, "systemd RestartUnit(bluetooth-meshd)")
+
+    def _systemd_stop_meshd(self):
+        def do():
+            self._systemd().StopUnit("bluetooth-meshd.service", "replace")
+        return self._safe_call(do, "systemd StopUnit(bluetooth-meshd)")
+
+    def _systemd_start_meshd(self):
+        def do():
+            self._systemd().StartUnit("bluetooth-meshd.service", "replace")
+        return self._safe_call(do, "systemd StartUnit(bluetooth-meshd)")
+
+    def _pkexec_run(self, argv: list[str], timeout: int = 60) -> tuple[bool, str]:
+        # Keep pkexec only for file deletion; systemd control now goes via D-Bus.
+        import subprocess
+        try:
+            mapped = []
+            for a in argv:
+                if a == "rm":
+                    mapped.append("/usr/bin/rm")
+                elif a in ("sh", "/bin/sh"):
+                    mapped.append("/bin/sh")
+                else:
+                    mapped.append(a)
+            out = subprocess.run(["/usr/bin/pkexec", *mapped],
+                                 capture_output=True, text=True, timeout=timeout)
+            if out.returncode == 0:
+                return True, (out.stdout.strip() or "OK")
+            return False, (out.stderr.strip() or out.stdout.strip() or f"rc={out.returncode}")
+        except Exception as e:
+            return False, f"pkexec exception: {e}"
+
+    def _current_uuid_hex(self) -> Optional[str]:
+        try:
+            from .util import NODE_UUID_FILE
+            if NODE_UUID_FILE.exists():
+                import json
+                j = json.loads(NODE_UUID_FILE.read_text())
+                hx = (j.get("uuid_hex") or "").strip().lower()
+                if len(hx) == 32:
+                    return hx
+        except Exception:
+            pass
+        try:
+            if self.node_path and self.node_path.startswith("/org/bluez/mesh/node"):
+                cand = self.node_path.rsplit("node", 1)[-1].lower()
+                if len(cand) == 32 and all(c in "0123456789abcdef" for c in cand):
+                    return cand
+        except Exception:
+            pass
+        return None
+
     # ---------------- GUI hooks ----------------
-    def set_gui_callbacks(self,
-                          log_cb: Optional[Callable[[str], None]] = None,
-                          scan_cb: Optional[Callable[[str, int], None]] = None):
+    def set_gui_callbacks(self, log_cb=None, scan_cb=None):
         if log_cb:
             self._log_cb = log_cb
         if scan_cb:
@@ -74,14 +132,11 @@ class Controller:
 
     # ---------------- Export objects ----------------
     def export(self):
-        # Register objects using explicit introspection XML
         self.bus.register_object(APP_ROOT,   self.app,   type(self.app).__dbus_xml__)
         self.bus.register_object(AGENT_PATH, self.agent, type(self.agent).__dbus_xml__)
         self.bus.register_object(ELEM0_PATH, self.elem0, type(self.elem0).__dbus_xml__)
-
         self.app._children = build_object_manager_map(self.app, self.agent, self.elem0)
         self.log(f"Exported objects under {APP_ROOT}")
-
 
     # ---------------- GLib loop ----------------
     def start_glib_thread(self):
@@ -94,77 +149,114 @@ class Controller:
 
     # ---------------- Token + Join/Attach ----------------
     def create_network(self):
-        """
-        Create our local node in the daemon DB (ADV bearer, No-OOB).
-        Fast path: CreateNetwork(app_root, uuid)
-        Fallback:  Import(app_root, uuid, dev_key, net_key, 0, flags, 0, 0x0001)
-        """
+        existing = load_token()
+        if existing is not None:
+            self.log(f"CreateNetwork: token already present ({existing}); doing Attach instead")
+            return self.attach(existing)
+
         from gi.repository import GLib
-        from .util import default_node_uuid_bytes
-        import os
+        import os, json, subprocess
 
         dev_uuid = default_node_uuid_bytes()
-        self._pending_uuid = dev_uuid  # remember until JoinComplete
-        self.log(f"CreateNetwork UUID={dev_uuid.hex()} (len={len(dev_uuid)})")
+        self._pending_uuid = dev_uuid
+        uhex = dev_uuid.hex()
+        self.log(f"CreateNetwork UUID={uhex} (len={len(dev_uuid)})")
         if len(dev_uuid) != 16:
             return False, "CreateNetwork: bad UUID length"
 
-        # ---------- fast path (CreateNetwork) ----------
-        def do_create():
-            # Prefer explicit DBus type 'ay'
+        # helper: recover token from /var/lib/... via pkexec (only read, should be reliable)
+        def _recover_token(uuid_hex: str):
             try:
-                self.mesh.CreateNetwork(APP_ROOT, GLib.Variant('ay', dev_uuid))
-                return
+                out = subprocess.run(
+                    ["/usr/bin/pkexec", "/bin/sh", "-c",
+                     f"cat /var/lib/bluetooth/mesh/{uuid_hex}/node.json 2>/dev/null"],
+                    capture_output=True, text=True, timeout=20
+                )
+                if out.returncode != 0:
+                    self.log(f"pkexec cat node.json failed: {out.stderr.strip() or out.stdout.strip()}")
+                    return None
+                j = json.loads(out.stdout)
+                tok_hex = (j.get("token") or "").strip().lower().removeprefix("0x")
+                if len(tok_hex) != 16:
+                    return None
+                return int(tok_hex, 16)
+            except Exception as e:
+                self.log(f"token recovery exception: {e}")
+                return None
+
+        mesh = self._get_mesh()
+
+        # fast path
+        try:
+            try:
+                mesh.CreateNetwork(APP_ROOT, GLib.Variant('ay', dev_uuid))
+                return True, "CreateNetwork: OK"
             except Exception as e1:
-                # Fallback: some bindings accept list[int] for 'ay'
                 try:
-                    self.mesh.CreateNetwork(APP_ROOT, list(dev_uuid))
-                    return
+                    mesh.CreateNetwork(APP_ROOT, list(dev_uuid))
+                    return True, "CreateNetwork: OK"
                 except Exception as e2:
-                    raise RuntimeError(
-                        f"CreateNetwork fast path failed: ay='{e1}', list[int]='{e2}'"
-                    )
+                    s1, s2 = f"{e1}", f"{e2}"
+                    if "AlreadyExists" in s1 or "AlreadyExists" in s2:
+                        self.log("CreateNetwork: AlreadyExists — attempting token recovery…")
+                        try:
+                            persist_node_uuid(dev_uuid)
+                            self.log(f"Persisted node UUID: {uhex}")
+                        except Exception as pe:
+                            self.log(f"Persist UUID failed: {pe}")
+                        tok = _recover_token(uhex)
+                        if tok is None:
+                            return False, "CreateNetwork: node exists; token recovery failed"
+                        save_token(tok)
+                        self.log(f"Recovered token=0x{tok:016x}; attempting Attach…")
+                        return self.attach(tok)
+                    self.log(f"CreateNetwork fast path failed: ay='{e1}', list[int]='{e2}'")
+        except Exception as e:
+            self.log(f"CreateNetwork failed: {e}")
 
-        ok, msg = self._safe_call(do_create, "CreateNetwork")
-        if ok:
-            return ok, msg
-
-        # ---------- fallback (Import with seeded keys) ----------
+        # fallback: Import
         dev_key = os.urandom(16)
         net_key = os.urandom(16)
-        flags = {
-            "IvUpdate":   GLib.Variant('b', False),
-            "KeyRefresh": GLib.Variant('b', False),
-        }
-
-        def do_import():
-            self.mesh.Import(
-                APP_ROOT,
-                bytes(dev_uuid),   # uuid (ay)
-                bytes(dev_key),    # dev_key (ay)
-                bytes(net_key),    # net_key (ay)
-                0,                 # net_index (uint16)
-                flags,             # dict{sv} with plain bools
-                0,                 # iv_index (uint32)
-                0x0001,            # unicast (uint16)
-            )
-
-        return self._safe_call(do_import, "Import")
+        flags = {"IvUpdate": GLib.Variant('b', False), "KeyRefresh": GLib.Variant('b', False)}
+        try:
+            mesh.Import(APP_ROOT, bytes(dev_uuid), bytes(dev_key), bytes(net_key),
+                        0, flags, 0, 0x0001)
+            return True, "Import: OK"
+        except Exception as e:
+            es = f"{e}"
+            if "AlreadyExists" in es:
+                self.log("Import: AlreadyExists — attempting token recovery…")
+                try:
+                    persist_node_uuid(dev_uuid)
+                    self.log(f"Persisted node UUID: {uhex}")
+                except Exception as pe:
+                    self.log(f"Persist UUID failed: {pe}")
+                tok = _recover_token(uhex)
+                if tok is None:
+                    return False, "Import: node exists; token recovery failed"
+                save_token(tok)
+                self.log(f"Recovered token=0x{tok:016x}; attempting Attach…")
+                return self.attach(tok)
+            msg = f"Import failed: {e}"
+            self.log(msg)
+            return False, msg
 
     def attach(self, token: Optional[int] = None):
-        """
-        Attach to our node (gets node object path + config). If token not passed,
-        it is loaded from ~/.config/vesp/token.json.
-        """
+        if self.is_attached:
+            return True, "Attach: already attached"
+        if self._attach_in_progress:
+            return False, "Attach: already in progress"
+
         tok = token if token is not None else load_token()
         if tok is None:
             raise RuntimeError("No token found. Run create_network() first.")
 
         self.log(f"Attach(APP_ROOT, token={tok})")
+        self._attach_in_progress = True
 
         def do_attach():
             try:
-                node, _cfg = self.mesh.Attach(APP_ROOT, int(tok))
+                node, _cfg = self._get_mesh().Attach(APP_ROOT, int(tok))
                 self.node_path = str(node)
                 self.mgmt = self.bus.get(MESH_BUS, self.node_path)
                 self.log(f"Attached. Node path: {self.node_path}")
@@ -179,30 +271,32 @@ class Controller:
                         raise
                 else:
                     raise
+            finally:
+                self._attach_in_progress = False
 
-        return self._safe_call(do_attach, "Attach")
+        ok, msg = self._safe_call(do_attach, "Attach")
+        if not ok:
+            self._attach_in_progress = False
+        return ok, msg
 
     def rebind_local(self):
-        """Recreate the Management1 proxy using cached node_path (when daemon says AlreadyExists)."""
         if self.mgmt:
             return True, "Rebind: already bound"
         if not self.node_path:
             return False, "Rebind failed: no cached node_path"
-
         def do_rebind():
             self.mgmt = self.bus.get(MESH_BUS, self.node_path)
             self.log(f"Rebound to existing node at {self.node_path}")
         return self._safe_call(do_rebind, "Rebind")
 
-    # ---------------- Provisioner flow (ADV-only) ----------------
+    # ---------------- Provisioner (ADV) ----------------
     def scan_start(self, seconds: Optional[int] = None):
-        """Start UnprovisionedScan (PB-ADV). Optional 'seconds' stops automatically."""
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
         opts: Dict[str, Any] = {}
         if seconds is not None:
-            s = max(1, min(int(seconds), 600))  # 1..600 clamp
-            opts["Seconds"] = GLib.Variant('q', s)  # uint16
+            s = max(1, min(int(seconds), 600))
+            opts["Seconds"] = GLib.Variant('q', s)
             self.log(f"UnprovisionedScan({s}s)")
         else:
             self.log("UnprovisionedScan({})  # until cancel")
@@ -214,7 +308,6 @@ class Controller:
             return self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
 
     def provision_uuid(self, uuid_hex: str):
-        """Provision a specific device UUID (32 hex chars, no dashes) over ADV bearer."""
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
         uh = uuid_hex.replace("-", "").strip().lower()
@@ -223,37 +316,30 @@ class Controller:
         self.log(f"AddNode({uuid_hex})")
         return self._safe_call(lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}), "AddNode")
 
-    # ---------------- Config Client helpers ----------------
+    # ---------------- Config helpers ----------------
     def reset_remote_node(self, unicast_str: str):
-        """
-        Send Configuration 'Node Reset' (0x8049) to a remote node's primary unicast.
-        Makes the device erase its provisioning data and start advertising again.
-        """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
-
         s = unicast_str.strip().lower()
         try:
             if s.startswith("0x"):
                 dest = int(s, 16)
             elif all(c in "0123456789abcdef" for c in s) and len(s) <= 4:
-                dest = int(s, 16)   # hex without 0x
+                dest = int(s, 16)
             else:
-                dest = int(s, 10)   # decimal
+                dest = int(s, 10)
         except ValueError:
-            raise ValueError("Unicast address must be hex (e.g. 0x1201 or 1201) or decimal.")
-
+            raise ValueError("Unicast must be hex (0x1201 / 1201) or decimal.")
         if not (0x0001 <= dest <= 0x7FFF):
-            raise ValueError("Unicast address out of range (0x0001..0x7FFF).")
+            raise ValueError("Unicast out of range (0x0001..0x7FFF).")
 
-        opcode = bytes([0x80, 0x49])  # Config Node Reset
+        opcode = bytes([0x80, 0x49])
         return self._safe_call(
             lambda: self.mgmt.DevKeySend(ELEM0_PATH, dest, True, 0x000, {}, opcode),
             "ConfigNodeReset"
         )
 
     def _ensure_appkey(self, app_index: int = 0, net_index: int = 0):
-        """Create AppKey in local key DB if missing (idempotent)."""
         def do():
             try:
                 self.mgmt.CreateAppKey(int(net_index), int(app_index))
@@ -266,51 +352,102 @@ class Controller:
                     raise
         return self._safe_call(do, "CreateAppKey")
 
-    def add_appkey_to_node(self, unicast: int, app_index: int = 0, net_index: int = 0, update: bool = False):
-        """Send Config AppKey Add/Update to the remote node using our Element0."""
+    def ensure_appkey(self, app_index: int = 0, net_index: int = 0):
+        return self._ensure_appkey(app_index=app_index, net_index=net_index)
+
+    def bind_model_sig(self, dest_unicast: int, elem_addr: int, app_index: int, model_id: int):
+        if not self.mgmt:
+            raise RuntimeError("Not attached yet")
         def do():
-            self.mgmt.AddAppKey(ELEM0_PATH, int(unicast), int(app_index), int(net_index), bool(update))
-            self.log(f"AddAppKey -> node 0x{unicast:04x} (app={app_index}, net={net_index}, update={update})")
-        return self._safe_call(do, f"AddAppKey(0x{unicast:04x})")
+            self.mgmt.Bind(ELEM0_PATH, int(dest_unicast), int(elem_addr), int(app_index), int(model_id))
+            self.log(f"Bind: node=0x{dest_unicast:04x} elem=0x{elem_addr:04x} app={app_index} model=0x{model_id:04x}")
+        return self._safe_call(do, f"Bind(0x{dest_unicast:04x})")
 
-    # ---------------- App/node lifecycle ----------------
-    @property
-    def is_attached(self) -> bool:
-        return self.node_path is not None and self.mgmt is not None
+    def sub_add_sig(self, dest_unicast: int, elem_addr: int, group_addr: int, model_id: int):
+        if not self.mgmt:
+            raise RuntimeError("Not attached yet")
+        def do():
+            self.mgmt.SubAdd(ELEM0_PATH, int(dest_unicast), int(elem_addr), int(group_addr), int(model_id))
+            self.log(f"SubAdd: node=0x{dest_unicast:04x} elem=0x{elem_addr:04x} group=0x{group_addr:04x} model=0x{model_id:04x}")
+        return self._safe_call(do, f"SubAdd(0x{dest_unicast:04x})")
 
-    def detach_local(self):
-        """Drop local proxies only (daemon stays attached)."""
-        if not self.is_attached:
-            return False, "Detach skipped: not attached."
-        def do_detach():
-            self.log("Detaching locally (closing mgmt proxy; keeping node_path)")
-            self.mgmt = None
-        return self._safe_call(do_detach, "Detach(local)")
-
-    def leave_network(self):
+    # ---------------- Purge / Leave ----------------
+    def purge_local_node(self):
         """
-        Ask bluetooth-meshd to forget/delete our node (by token),
-        then clear local token and proxies.
+        Deep purge using systemd D-Bus (no pkexec for systemctl).
+        1) Stop meshd   (polkit prompt if needed)
+        2) rm -rf node  (pkexec just for rm)
+        3) Start meshd  (polkit prompt if needed)
+        """
+        uuid_hex = self._current_uuid_hex()
+        if not uuid_hex:
+            return False, "Purge: no local UUID found (nothing to delete)"
+
+        self.log(f"Purge: target UUID={uuid_hex}")
+
+        ok, msg = self._systemd_stop_meshd()
+        if not ok:
+            return False, f"Purge: failed to stop meshd ({msg})"
+
+        ok, msg = self._pkexec_run(["rm", "-rf", f"/var/lib/bluetooth/mesh/{uuid_hex}"])
+        self.log(f"Purge: rm dir -> {msg}")
+        if not ok:
+            # try to restart anyway
+            self._systemd_start_meshd()
+            return False, f"Purge: failed to delete node dir ({msg})"
+
+        ok, msg = self._systemd_start_meshd()
+        if not ok:
+            return False, f"Purge: meshd failed to start ({msg})"
+
+        # clear local state
+        try:
+            clear_token()
+            from .util import NODE_UUID_FILE
+            try:
+                NODE_UUID_FILE.unlink(missing_ok=True)  # py3.8+
+            except TypeError:
+                import os
+                try: os.remove(NODE_UUID_FILE)
+                except Exception: pass
+            self.mgmt = None
+            self.node_path = None
+        except Exception as e:
+            self.log(f"Purge: local cleanup warning: {e}")
+
+        return True, "Purge: OK (node dir removed; meshd restarted)"
+
+    def leave_network(self, deep: bool = False):
+        """
+        Forget our node by token; optionally restart meshd (via systemd D-Bus).
         """
         tok = load_token()
         if tok is None:
-            return False, "Leave failed: no token found (nothing to forget)"
+            return False, "Leave skipped: no token found (nothing to forget)"
 
         def do_leave():
             self.log(f"Leave({tok})")
-            self.mesh.Leave(int(tok))  # Network1.Leave(uint64 token)
+            self._get_mesh().Leave(int(tok))
             clear_token()
             self.mgmt = None
             self.node_path = None
             self.log("Leave: OK (daemon node removed; local token cleared)")
-        return self._safe_call(do_leave, "Leave")
 
-    # ---------------- Callbacks from our exported objects ----------------
+        ok, msg = self._safe_call(do_leave, "Leave")
+        if not ok or not deep:
+            return ok, msg
+
+        ok2, msg2 = self._systemd_restart_meshd()
+        if ok2:
+            return True, "Leave: OK (daemon restarted)"
+        else:
+            self.log("Run manually:\n  sudo systemctl restart bluetooth-meshd")
+            return True, "Leave: node removed; restart daemon manually (see log)"
+
+    # ---------------- Callbacks ----------------
     def on_join_complete(self, token: int):
         self.log(f"JoinComplete token=0x{token:016x}")
         save_token(token)
-
-        # Persist the UUID only now (first successful join)
         if self._pending_uuid is not None:
             try:
                 persist_node_uuid(self._pending_uuid)
@@ -319,8 +456,6 @@ class Controller:
                 self.log(f"Persist UUID failed: {e}")
             finally:
                 self._pending_uuid = None
-
-        # Auto-attach for convenience
         try:
             self.attach(token)
         except Exception as e:
@@ -330,7 +465,6 @@ class Controller:
         self.log(f"JoinFailed: {reason}")
 
     def on_scan_result(self, rssi: int, adv: bytes, options: Optional[Dict[str, Any]]):
-        # Try to parse UUID directly from ADV (PB-ADV/Mesh Beacon/Service Data).
         self.log(f"[Scan] rssi={rssi} len={len(adv)} adv={adv.hex()[:64]}...")
         uuid_hex = parse_unprov_uuid(adv)
         if uuid_hex:
@@ -347,7 +481,6 @@ class Controller:
 
     def on_add_node_complete(self, uuid_bytes: bytes, unicast: int, count: int):
         self.log(f"AddNodeComplete: uuid={uuid_bytes.hex()} unicast=0x{unicast:04x} elements={count}")
-        # Ensure AppKey(0) exists locally and push it to the new node's primary address.
         self._ensure_appkey(app_index=0, net_index=0)
         ok, msg = self.add_appkey_to_node(unicast, app_index=0, net_index=0, update=False)
         if not ok:
@@ -358,10 +491,8 @@ class Controller:
     def on_add_node_failed(self, uuid_bytes: bytes, reason: str):
         self.log(f"AddNodeFailed: uuid={uuid_bytes.hex()} reason={reason}")
 
-    # Incoming access/DevKey messages to our Element0
     def on_element_message(self, source: int, key_index: int, destination, data: bytes):
         try:
-            # Basic on/off status peek (0x82 0x04)
             info = "unknown"
             if len(data) >= 3 and data[0] == 0x82 and data[1] == 0x04:
                 info = f"GenericOnOffStatus(on={data[2]})"
@@ -370,7 +501,6 @@ class Controller:
                 f"len={len(data)} data={data.hex()} dec={info}"
             )
             self.log(line)
-            # Append to log file
             (LOG_DIR / "mesh_app.log").open("a", encoding="utf-8").write(line + "\n")
         except Exception as e:
             self.log(f"[Element0] MessageReceived error: {e}")
@@ -395,4 +525,16 @@ class Controller:
             emsg = e.args[0] if e.args else str(e)
             self.log(f"{label} failed: {emsg}")
             return False, f"{label} failed: {emsg}"
+
+    @property
+    def is_attached(self) -> bool:
+        return self.node_path is not None and self.mgmt is not None
+
+    def detach_local(self):
+        if not self.is_attached:
+            return False, "Detach skipped: not attached."
+        def do_detach():
+            self.log("Detaching locally (closing mgmt proxy; keeping node_path)")
+            self.mgmt = None
+        return self._safe_call(do_detach, "Detach(local)")
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional, Tuple
 from gi.repository import GLib
-# pydbus.generic.signal import not used; remove to avoid unused-import warnings
 
 APP_ROOT   = "/org/vesp/app"
 AGENT_PATH = "/org/vesp/app/agent"
@@ -130,9 +129,13 @@ class AppRoot:
             "Index":        GLib.Variant('y', 0),       # uint8
             "Location":     GLib.Variant('q', 0x0000),  # uint16 (primary)
             "Models": GLib.Variant('a(qa{sv})', [
-                (0x0000, {}),  # Configuration Server (mandatory on primary)
-                (0x0002, {}),  # Health Server (expected by many stacks)
+                (0x0000, {}),  # Configuration Server
                 (0x0001, {}),  # Configuration Client
+                (0x0002, {}),  # Health Server
+                (0x0004, {}),  # Remote Provisioning Server
+                (0x0005, {}),  # Remote Provisioning Client
+                (0x0008, {}),  # Private Beacon Server
+                (0x1001, {}),  # Generic OnOff Client
             ]),
             "VendorModels": GLib.Variant('a(qqa{sv})', []),
         }
