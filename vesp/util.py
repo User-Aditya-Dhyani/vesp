@@ -17,6 +17,10 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 NODE_UUID_FILE = STATE_DIR / "node_uuid.json"
 
+CONFIG_DIR = STATE_DIR
+CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+NODES_FILE = CONFIG_DIR / "nodes.json"
 
 # ---------- token helpers ----------
 def save_token(token: int) -> None:
@@ -84,6 +88,37 @@ def normalize_uuid_hex(s: str) -> str:
     return x
 
 
+def load_nodes_db():
+    """
+    Returns a dict mapping remote UUID hex -> {
+        "unicast": int,
+        "elements": int,
+        "last_onoff": 0 or 1 or None
+    }
+    """
+    try:
+        with NODES_FILE.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            # normalize types just in case
+            for k, v in list(data.items()):
+                if not isinstance(v, dict):
+                    data[k] = {}
+            return data
+    except Exception:
+        return {}
+
+def save_nodes_db(db: dict):
+    """
+    Safely persist nodes.json.
+    """
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with NODES_FILE.open("w", encoding="utf-8") as f:
+            json.dump(db, f, indent=2, sort_keys=True)
+    except Exception:
+        # non-fatal, just ignore
+        pass
+        
 # ---------- Mesh address parsing ----------
 def parse_unicast_addr(s: str) -> int:
     """
@@ -106,42 +141,34 @@ def parse_unicast_addr(s: str) -> int:
 
 
 # ---------- ADV parsing (PB-ADV only; no GATT) ----------
-def parse_unprov_uuid(adv: bytes) -> Optional[str]:
+def parse_unprov_uuid(adv: bytes):
     """
-    Extract the 16-byte Device UUID of an unprovisioned mesh node from ADV:
-      * AD type 0x2B (Mesh Beacon):
-          [len][0x2B][beacon_type=0x00][16B UUID]...
-      * AD type 0x29 (Mesh Provisioning PDU over ADV bearer):
-          [len][0x29][pdu_type][16B UUID]...
-      * AD type 0x16 (Service Data) for 0x1827 (Mesh Provisioning Service):
-          [len][0x16][0x27,0x18][pdu_type][16B UUID]...
-    Returns lowercase 32-hex UUID string, or None if not found.
+    Try to extract a 16-byte Device UUID from an unprovisioned device beacon
+    as delivered by bluetooth-meshd's Provisioner1.ScanResult.
+
+    Observed format from BlueZ on your machine (len = 22 bytes):
+      [0:16]  Device UUID
+      [16:18] OOB Info (little-endian)
+      [18:22] URI Hash (optional, often 0x00000000)
+
+    We treat the first 16 bytes as the UUID and return it as lowercase hex,
+    as long as it's not all 0x00 or all 0xff.
     """
-    i, n = 0, len(adv)
-    while i < n:
-        if i + 1 > n:
-            break
-        length = adv[i]
-        i += 1
-        if length == 0 or i + length > n:
-            break
-        ad_type = adv[i]
-        ad_data = adv[i + 1 : i + length]
-        i += length
+    if not isinstance(adv, (bytes, bytearray)):
+        return None
 
-        # 0x2B: Mesh Beacon (Unprovisioned Device)
-        if ad_type == 0x2B and len(ad_data) >= 1 + 16:
-            if ad_data[0] == 0x00:
-                return ad_data[1:17].hex()
+    # Need at least 16 bytes for UUID
+    if len(adv) < 16:
+        return None
 
-        # 0x29: Mesh Provisioning PDU over ADV bearer
-        if ad_type == 0x29 and len(ad_data) >= 1 + 16:
-            return ad_data[1:17].hex()
+    uuid_bytes = adv[0:16]
 
-        # 0x16: Service Data (16-bit UUID) – expect 0x1827 little-endian
-        if ad_type == 0x16 and len(ad_data) >= 2:
-            if ad_data[0] == 0x27 and ad_data[1] == 0x18:
-                if len(ad_data) >= 2 + 1 + 16:
-                    return ad_data[3 : 3 + 16].hex()
-    return None
+    # Filter out garbage like all zeros or all 0xff
+    if all(b == 0x00 for b in uuid_bytes):
+        return None
+    if all(b == 0xFF for b in uuid_bytes):
+        return None
+
+    # Return nice clean hex string, 32 lowercase chars
+    return uuid_bytes.hex()
 

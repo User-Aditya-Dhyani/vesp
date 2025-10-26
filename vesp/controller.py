@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Callable, Optional, Any, Dict
 from pydbus import SystemBus
 from gi.repository import GLib
-
+import threading
 from .dbus_mesh import (
     APP_ROOT, AGENT_PATH, ELEM0_PATH,
     AppRoot, ProvisionAgent, Element0,
@@ -308,13 +308,34 @@ class Controller:
             return self._safe_call(lambda: self.mgmt.UnprovisionedScanCancel(), "UnprovisionedScanCancel")
 
     def provision_uuid(self, uuid_hex: str):
+        """
+        Try to provision the given unprovisioned device UUID (PB-ADV style).
+
+        Important details:
+        - We NO LONGER stop the scan before provisioning.
+          BlueZ seems to expect to still be 'tracking' that advertiser.
+        - We NO LONGER pass unsupported options like Bearer=adv, because
+          your bluetooth-meshd rejects that with InvalidArgs.
+        - We just call AddNode(uuid, {}) and let meshd pick PB-ADV.
+        """
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
+
+        # normalize UUID string
         uh = uuid_hex.replace("-", "").strip().lower()
-        if len(uh) != 32:
+
+        # strict validate: 32 hex chars = 16-byte UUID
+        if len(uh) != 32 or any(c not in "0123456789abcdef" for c in uh):
             raise ValueError("UUID must be 16 bytes (32 hex chars)")
-        self.log(f"AddNode({uuid_hex})")
-        return self._safe_call(lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}), "AddNode")
+
+        self.log(f"AddNode({uh})")
+
+        # IMPORTANT: we *don't* cancel scan here anymore
+        # and we pass empty options dict, which your daemon accepts.
+        return self._safe_call(
+            lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}),
+            "AddNode"
+        )
 
     # ---------------- Config helpers ----------------
     def reset_remote_node(self, unicast_str: str):
@@ -354,6 +375,39 @@ class Controller:
 
     def ensure_appkey(self, app_index: int = 0, net_index: int = 0):
         return self._ensure_appkey(app_index=app_index, net_index=net_index)
+        
+    def add_appkey_to_node(self, unicast: int, app_index: int = 0,
+                           net_index: int = 0, update: bool = False):
+        """
+        Send Config AppKey Add (or Update) to the remote node.
+
+        This tells the device "here is AppKey #app_index, please install it".
+        BlueZ does the DevKey-based Config AppKey Add under the hood.
+
+        Args:
+            unicast    = primary address of the node we're configuring (e.g. 0x0005)
+            app_index  = which AppKey index (we're using 0 for now)
+            net_index  = which NetKey index (we're using 0 for now)
+            update     = False means 'Add', True means 'Update'
+        """
+        if not self.mgmt:
+            raise RuntimeError("Not attached yet")
+
+        def do():
+            # Management1.AddAppKey(ElementPath, dst_unicast, app_idx, net_idx, update_bool)
+            self.mgmt.AddAppKey(
+                ELEM0_PATH,
+                int(unicast),
+                int(app_index),
+                int(net_index),
+                bool(update),
+            )
+            self.log(
+                f"AddAppKey -> node 0x{unicast:04x} "
+                f"(app={app_index}, net={net_index}, update={update})"
+            )
+
+        return self._safe_call(do, f"AddAppKey(0x{unicast:04x})")
 
     def bind_model_sig(self, dest_unicast: int, elem_addr: int, app_index: int, model_id: int):
         if not self.mgmt:
@@ -480,16 +534,58 @@ class Controller:
         return start
 
     def on_add_node_complete(self, uuid_bytes: bytes, unicast: int, count: int):
-        self.log(f"AddNodeComplete: uuid={uuid_bytes.hex()} unicast=0x{unicast:04x} elements={count}")
-        self._ensure_appkey(app_index=0, net_index=0)
-        ok, msg = self.add_appkey_to_node(unicast, app_index=0, net_index=0, update=False)
-        if not ok:
-            self.log(msg)
-        else:
-            self.log("AppKey(0) added to remote node (bind model as needed later).")
+        """
+        Called by meshd (GLib thread!) after provisioning succeeds.
+        We MUST NOT do blocking D-Bus calls here. So we offload all the real work
+        to a background thread, and just log quickly.
+        """
+        uuid_hex = uuid_bytes.hex()
+        self.log(
+            f"AddNodeComplete: uuid={uuid_hex} "
+            f"unicast=0x{unicast:04x} elements={count}"
+        )
+
+        # Spawn a worker thread to do AppKey, persist info, etc.
+        def _finalize_worker():
+            # 1. Make sure we have local AppKey(0)
+            self._ensure_appkey(app_index=0, net_index=0)
+
+            # 2. Push that AppKey to the new node
+            ok, msg = self.add_appkey_to_node(
+                unicast,
+                app_index=0,
+                net_index=0,
+                update=False
+            )
+            if not ok:
+                self.log(f"[finalize {uuid_hex}] add_appkey failed: {msg}")
+            else:
+                self.log(f"[finalize {uuid_hex}] AppKey(0) added to node 0x{unicast:04x}")
+
+            # 3. Persist node info to ~/.config/vesp/nodes.json
+            try:
+                from .util import load_nodes_db, save_nodes_db
+                db = load_nodes_db()
+                db[uuid_hex] = {
+                    "unicast": int(unicast),
+                    "elements": int(count),
+                    "last_onoff": None,
+                }
+                save_nodes_db(db)
+                self.log(f"[finalize {uuid_hex}] saved to nodes.json")
+            except Exception as e:
+                self.log(f"[finalize {uuid_hex}] persist failed: {e}")
+
+            # 4. (future) we can also auto-bind model + subscribe + set pub addr here
+            #    but we’ll add those buttons / logic after we confirm provisioning,
+            #    because those are more ConfigClient ops.
+
+        threading.Thread(target=_finalize_worker, daemon=True).start()
 
     def on_add_node_failed(self, uuid_bytes: bytes, reason: str):
-        self.log(f"AddNodeFailed: uuid={uuid_bytes.hex()} reason={reason}")
+        self.log(
+            f"AddNodeFailed: uuid={uuid_bytes.hex()} reason={reason}"
+        )
 
     def on_element_message(self, source: int, key_index: int, destination, data: bytes):
         try:
