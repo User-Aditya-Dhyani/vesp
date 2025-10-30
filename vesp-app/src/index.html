@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self';"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VESP Mesh (ADV-only)</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'; }
+      .bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+      .bar input { padding: 4px 6px; }
+      #log { height: 65vh; overflow: auto; border: 1px solid #444; padding: 10px; white-space: pre-wrap; background: #0b0b0b; color: #e6e6e6; }
+      button { padding: 6px 10px; cursor: pointer; }
+      .muted { opacity: .7; }
+      .row { margin: 8px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <h2>VESP Mesh (ADV-only)</h2>
+
+    <div class="bar">
+      <button id="btnDoctor">Doctor</button>
+      <button id="btnCreate">Create Network</button>
+      <button id="btnAttach">Attach</button>
+
+      <span class="muted">Scan (seconds):</span>
+      <input id="secs" value="15" style="width: 4em" />
+      <button id="btnScan">Scan</button>
+
+      <span class="muted">Provision UUID (hex32):</span>
+      <input id="uuidHex" placeholder="e.g. a1b2... (32 hex)" style="width: 20em" />
+      <button id="btnProvision">Provision</button>
+
+      <span class="muted">Reset Unicast (hex):</span>
+      <input id="unicast" placeholder="e.g. 0003" style="width: 6em" />
+      <button id="btnReset">Reset</button>
+
+      <button id="btnLeave">Leave</button>
+      <button id="btnPurge">Purge</button>
+    </div>
+
+    <div class="row">
+      <button id="btnPollLogs">Poll Logs</button>
+      <span class="muted">Logs auto-polls every 1s</span>
+    </div>
+
+    <pre id="log"></pre>
+
+    <script src="/main.js" type="module"></script>
+  </body>
+</html>
+
