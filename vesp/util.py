@@ -90,10 +90,17 @@ def normalize_uuid_hex(s: str) -> str:
 
 def load_nodes_db():
     """
-    Returns a dict mapping remote UUID hex -> {
-        "unicast": int,
-        "elements": int,
-        "last_onoff": 0 or 1 or None
+    Returns a dict:
+    {
+      "<remote_uuid_hex>": {
+         "unicast": int,
+         "elements": int,
+         "last_onoff": 0|1|None,
+         "last_seen": "ISO8601 or None",
+         "provisioned_at": "ISO8601",
+         "state": "active"|"reset_sent"|...
+      },
+      ...
     }
     """
     try:
