@@ -311,10 +311,15 @@ class Controller:
         if not self.mgmt:
             raise RuntimeError("Not attached yet")
         uh = uuid_hex.replace("-", "").strip().lower()
-        if len(uh) != 32:
+        if len(uh) != 32 or any(c not in "0123456789abcdef" for c in uh):
             raise ValueError("UUID must be 16 bytes (32 hex chars)")
-        self.log(f"AddNode({uuid_hex})")
-        return self._safe_call(lambda: self.mgmt.AddNode(bytes.fromhex(uh), {}), "AddNode")
+        self.log(f"AddNode({uuid_hex}) via PB-ADV")
+
+        uuid_b = bytes.fromhex(uh)   # marshalled to D-Bus 'ay' by pydbus
+        opts   = {}                  # marshalled to D-Bus 'a{sv}' (empty map is valid)
+
+        return self._safe_call(lambda: self.mgmt.AddNode(uuid_b, opts), "AddNode")
+
 
     # ---------------- Config helpers ----------------
     def reset_remote_node(self, unicast_str: str):
@@ -516,6 +521,10 @@ class Controller:
         except Exception as e:
             self.log(f"[Element0] DevKeyMessageReceived error: {e}")
             
+    def _get_network_iface(self):
+        # org.bluez.mesh1.Network lives at the mesh root path
+        return self.bus.get(MESH_BUS, "/org/bluez/mesh")
+
     def forget_node_uuid(self, uuid_hex: str) -> bool:
         """
         Best-effort local removal of a remote node from bluetooth-meshd's DB
@@ -559,9 +568,32 @@ class Controller:
             fn()
             return True, f"{label}: OK"
         except Exception as e:
-            emsg = e.args[0] if e.args else str(e)
-            self.log(f"{label} failed: {emsg}")
-            return False, f"{label} failed: {emsg}"
+            # Try to extract useful D-Bus/GLib details
+            name = None
+            code = None
+            try:
+                # pydbus GLib.Error often exposes .get_dbus_name()
+                if hasattr(e, "get_dbus_name"):
+                    name = e.get_dbus_name()
+            except Exception:
+                pass
+            try:
+                # GI GLib.Error sometimes has .domain and .code
+                from gi.repository import GLib as _GLib
+                if isinstance(e, _GLib.Error):
+                    name = name or str(e.domain)
+                    code = e.code
+            except Exception:
+                pass
+
+            emsg = str(e) or repr(e)
+            if name is not None:
+                self.log(f"{label} failed: {emsg}  [dbus_name={name}" + (f", code={code}]" if code is not None else "]"))
+                return False, f"{label} failed: {name} ({emsg})"
+            else:
+                self.log(f"{label} failed: {emsg}")
+                return False, f"{label} failed: {emsg}"
+
 
     @property
     def is_attached(self) -> bool:
