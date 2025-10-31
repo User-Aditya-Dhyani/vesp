@@ -118,6 +118,23 @@ def parse_unprov_uuid(adv: bytes) -> Optional[str]:
     Returns lowercase 32-hex UUID string, or None if not found.
     """
     i, n = 0, len(adv)
+    
+
+    if n == 16:
+        try:
+            return adv.hex()
+        except Exception:
+            pass
+    if n in (18, 20, 22) and n >= 16:
+        try:
+            tail = adv[16:]
+            if all(b == 0x00 for b in tail):
+                return adv[:16].hex()
+        except Exception:
+            pass
+
+    # Generic AD-structure parsing
+    
     while i < n:
         if i + 1 > n:
             break

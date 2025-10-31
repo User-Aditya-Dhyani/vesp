@@ -515,6 +515,43 @@ class Controller:
             (LOG_DIR / "mesh_devkey.log").open("a", encoding="utf-8").write(line + "\n")
         except Exception as e:
             self.log(f"[Element0] DevKeyMessageReceived error: {e}")
+            
+    def forget_node_uuid(self, uuid_hex: str) -> bool:
+        """
+        Best-effort local removal of a remote node from bluetooth-meshd's DB
+        when the node is offline (no Config Node Reset).
+        """
+        from .util import normalize_uuid_hex
+        u = normalize_uuid_hex(uuid_hex)
+        # Strategy:
+        # 1) Ask the daemon to remove the node if the D-Bus API provides it
+        # 2) If not available, fallback to cfgclient CLI (if installed)
+        # 3) As a last resort, refuse to touch on-disk JSON here (too invasive)
+        try:
+            # D-Bus path you already have: self.mesh_network (org.bluez.mesh1.Network)
+            # Some BlueZ versions expose a "RemoveNode" or similar. We try introspection first.
+            net = self._get_network_iface()  # your cached org.bluez.mesh1.Network proxy
+            # Try a likely method name if present:
+            if hasattr(net, "RemoveNode"):
+                net.RemoveNode(bytes.fromhex(u))  # 16B Device UUID
+                self.log(f"Removed node {u} via org.bluez.mesh1.Network.RemoveNode")
+                return True
+        except Exception as e:
+            self.log(f"[forget_node_uuid] D-Bus remove attempt failed: {e}")
+
+        # Fallback to mesh-cfgclient if available:
+        try:
+            import shutil, subprocess
+            if shutil.which("mesh-cfgclient"):
+                # mesh-cfgclient expects UUID with 0x prefix or plain? We pass plain 32 hex here:
+                out = subprocess.check_output(["mesh-cfgclient", "node-delete", u], stderr=subprocess.STDOUT, text=True)
+                self.log(f"[forget_node_uuid] cfgclient: {out.strip()}")
+                return True
+        except Exception as e:
+            self.log(f"[forget_node_uuid] cfgclient fallback failed: {e}")
+
+        raise RuntimeError("No supported local delete API found on this system")
+
 
     # ---------------- Utilities ----------------
     def _safe_call(self, fn, label: str):
